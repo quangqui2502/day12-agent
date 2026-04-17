@@ -59,14 +59,14 @@ curl http://localhost:8000/ask -X POST -H "Content-Type: application/json" \
 **Image size:**
 ```
 REPOSITORY       TAG       SIZE
-my-agent         develop   413MB
+my-agent         develop   1.66GB
 ```
 
 ### Exercise 2.3: Image size comparison
 
-- **Develop:** 413 MB (full python:3.11 + all tools)
-- **Production:** 56.7 MB (slim + multi-stage build)
-- **Improvement:** 86% smaller ⚡
+- **Develop:** 1.66 GB (full python:3.11 + all tools)
+- **Production:** 262 MB (slim + multi-stage build)
+- **Improvement:** 84% smaller ⚡
 
 **Why?**
 - Stage 1 (builder): python:3.11-slim + gcc + build tools → compile packages → creates .whl files
