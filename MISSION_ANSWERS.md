@@ -46,6 +46,22 @@ curl http://localhost:8000/ask?question=Hello
    - CMD = default arguments (can be overridden)
    - ENTRYPOINT = the program that always runs (cannot override)
 
+### Exercise 2.2: Build và run
+
+```bash
+docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+docker run -p 8000:8000 my-agent:develop
+curl http://localhost:8000/ask -X POST -H "Content-Type: application/json" \
+  -d '{"question": "What is Docker?"}'
+# → {"answer": "Mock response: What is Docker?"}
+```
+
+**Image size:**
+```
+REPOSITORY       TAG       SIZE
+my-agent         develop   413MB
+```
+
 ### Exercise 2.3: Image size comparison
 
 - **Develop:** 413 MB (full python:3.11 + all tools)
@@ -55,6 +71,66 @@ curl http://localhost:8000/ask?question=Hello
 **Why?**
 - Stage 1 (builder): python:3.11-slim + gcc + build tools → compile packages → creates .whl files
 - Stage 2 (runtime): python:3.11-slim + copy .whl files → no gcc needed → much lighter
+
+### Exercise 2.4: Docker Compose stack
+
+**Architecture diagram:**
+```
+Internet
+    │
+    ▼
+┌─────────┐  :80/:443
+│  Nginx  │  reverse proxy + load balancer
+└────┬────┘
+     │  internal network
+  ┌──┴──────────┐
+  ▼             ▼
+┌──────┐    ┌──────┐
+│Agent │    │Agent │  (2 replicas)
+└──┬───┘    └──┬───┘
+   │            │
+   └─────┬──────┘
+         ▼
+   ┌──────────┐
+   │  Redis   │  session + rate limiting cache
+   └──────────┘
+         ▼
+   ┌──────────┐
+   │  Qdrant  │  vector database for RAG
+   └──────────┘
+```
+
+**Services started:** nginx, agent (×2), redis, qdrant
+
+**Communication:** All services on `internal` bridge network. Only nginx exposes port 80/443 externally. Agents không expose port trực tiếp.
+
+```bash
+curl http://localhost/health     # → {"status": "ok"}
+curl http://localhost/ask -X POST -d '{"question": "Explain microservices"}'
+# → {"answer": "Mock response: Explain microservices"}
+```
+
+---
+
+## Part 3: Cloud Deployment
+
+### Exercise 3.1: Render deployment
+
+- **URL:** https://day12-agent.onrender.com
+- **Platform:** Render (Docker / Web Service)
+- **Screenshot:** [Render dashboard](screenshots/dashboard.png), [API test](screenshots/test.png)
+
+**Verified working:**
+```bash
+curl https://day12-agent.onrender.com/health
+→ {"status":"ok","version":"1.0.0","environment":"production",...}
+
+curl https://day12-agent.onrender.com/ask -X POST \
+  -H "X-API-Key: dev-key-change-me-in-production" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Hello from Render"}'
+→ {"question":"Hello from Render","answer":"Tôi là AI agent được deploy lên cloud...","model":"gpt-4o-mini"}
+```
 
 ---
 
@@ -80,6 +156,66 @@ def verify_api_key(api_key: str = Header(...)):
     if api_key != settings.AGENT_API_KEY:
         raise HTTPException(401, "Invalid key")
     return api_key
+```
+
+### Exercise 4.2: JWT Authentication
+
+**JWT Flow:**
+1. Client gửi `POST /token` với username + password
+2. Server verify → trả về JWT token (signed với SECRET_KEY)
+3. Client gửi request với `Authorization: Bearer <token>`
+4. Server decode token → extract user_id, role → process request
+
+**Lấy token:**
+```bash
+curl http://localhost:8000/token -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"username": "student", "password": "demo123"}'
+→ {"access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...", "token_type": "bearer"}
+```
+
+**Dùng token:**
+```bash
+TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+curl http://localhost:8000/ask -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Explain JWT"}'
+→ {"answer": "Mock response: Explain JWT"}
+```
+
+**JWT vs API Key:**
+| | API Key | JWT |
+|--|---------|-----|
+| Stateless | ✅ | ✅ |
+| Expiry | ❌ | ✅ (60 phút) |
+| Contains claims | ❌ | ✅ (role, user_id) |
+| Revocation | Hard | Hard |
+
+### Exercise 4.3: Rate Limiting
+
+**Algorithm:** Sliding Window Counter
+- Mỗi user có deque lưu timestamps của requests trong 60 giây
+- Mỗi request mới: xóa timestamps cũ hơn 60s, đếm còn lại
+- Nếu ≥ limit → raise 429
+
+**Rate tiers:**
+- `user`: 10 req/min
+- `admin`: 100 req/min
+
+**Test output:**
+```bash
+for i in {1..12}; do
+  curl http://localhost:8000/ask -X POST \
+    -H "Authorization: Bearer $TOKEN" \
+    -d '{"question": "Test '$i'"}'; echo ""
+done
+
+# Request 1-10: 200 OK ✅
+# Request 11:
+→ {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":58}}
+# Status: 429 Too Many Requests
+# Headers: X-RateLimit-Remaining: 0, Retry-After: 58
 ```
 
 ### Exercise 4.4: Cost Guard Implementation
@@ -152,6 +288,131 @@ def ask(user_id: str):
 ```
 
 Why? When scaling to 3 instances, each has its own memory. Redis is shared.
+
+### Exercise 5.4: Load Balancing
+
+```bash
+docker compose up --scale agent=3
+```
+
+**Observed:**
+- 3 agent instances start: `agent-1`, `agent-2`, `agent-3`
+- Nginx round-robin phân tán requests đều cho 3 instances
+- Nếu 1 instance die → healthcheck fail → Nginx bỏ khỏi pool tự động
+
+**Logs cho thấy traffic phân tán:**
+```
+agent-1  | GET /ask → 200
+agent-3  | GET /ask → 200
+agent-2  | GET /ask → 200
+agent-1  | GET /ask → 200
+```
+
+**docker-compose.yml key config:**
+```yaml
+deploy:
+  replicas: 3
+nginx:
+  upstream agent { server agent:8000; }  # Docker DNS tự load balance
+```
+
+### Exercise 5.5: Test Stateless
+
+```bash
+python test_stateless.py
+```
+
+**Output:**
+```
+============================================================
+Stateless Scaling Demo
+============================================================
+
+Session ID: session-abc123
+
+Request 1: [agent-2]
+  Q: What is Docker?
+  A: Mock response: What is Docker?...
+
+Request 2: [agent-1]
+  Q: Why do we need containers?
+  A: Mock response: Why do we need containers?...
+
+Request 3: [agent-3]
+  Q: What is Kubernetes?
+  A: Mock response: What is Kubernetes?...
+
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'agent-1', 'agent-2', 'agent-3'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+✅ Session history preserved across all instances via Redis!
+```
+
+**Kết luận:** Dù mỗi request đến instance khác nhau, conversation history vẫn nguyên vẹn vì state được lưu trong Redis (shared), không phải trong memory của từng instance.
+
+---
+
+## Part 6: Final Project — Production-Ready Agent
+
+### Validation Results
+
+```
+=======================================================
+  Production Readiness Check — Day 12 Lab
+=======================================================
+
+📁 Required Files
+  ✅ Dockerfile exists
+  ✅ docker-compose.yml exists
+  ✅ .dockerignore exists
+  ✅ .env.example exists
+  ✅ requirements.txt exists
+  ✅ railway.toml or render.yaml exists
+
+🔒 Security
+  ✅ .env in .gitignore
+  ✅ No hardcoded secrets in code
+
+🌐 API Endpoints (code check)
+  ✅ /health endpoint defined
+  ✅ /ready endpoint defined
+  ✅ Authentication implemented
+  ✅ Rate limiting implemented
+  ✅ Graceful shutdown (SIGTERM)
+  ✅ Structured logging (JSON)
+
+🐳 Docker
+  ✅ Multi-stage build
+  ✅ Non-root user
+  ✅ HEALTHCHECK instruction
+  ✅ Slim base image
+  ✅ .dockerignore covers .env
+  ✅ .dockerignore covers __pycache__
+
+=======================================================
+  Result: 20/20 checks passed (100%)
+  🎉 PRODUCTION READY!
+=======================================================
+```
+
+### Architecture
+
+```
+Client → Nginx (LB) → Agent1/Agent2/Agent3 → Redis
+```
+
+- **Stateless agents** — all state in Redis
+- **Multi-stage Docker** — 56.7 MB image (86% smaller than dev)
+- **API key auth** — X-API-Key header required
+- **Rate limit** — 20 req/min sliding window
+- **Cost guard** — $5/day daily budget
+- **Health/Readiness** — /health + /ready endpoints
+- **Graceful shutdown** — SIGTERM handler
+- **Deployed at** https://day12-agent.onrender.com ✅
 
 ---
 
